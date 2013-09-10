@@ -21,6 +21,7 @@
 #include "include/atomic.h"
 #include "include/types.h"
 #include "include/compat.h"
+#include "include/Spinlock.h"
 
 #include <errno.h>
 #include <fstream>
@@ -60,9 +61,13 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     unsigned len;
     atomic_t nref;
 
-    raw(unsigned l) : data(NULL), len(l), nref(0)
+    Spinlock crc_lock;
+    int64_t crc_in;   ///< cached crc base; -1 if invalid
+    int64_t crc_out;  ///< cached crc value; -1 if invalid
+
+    raw(unsigned l) : data(NULL), len(l), nref(0), crc_in(-1), crc_out(-1)
     { }
-    raw(char *c, unsigned l) : data(c), len(l), nref(0)
+    raw(char *c, unsigned l) : data(c), len(l), nref(0), crc_in(-1), crc_out(-1)
     { }
     virtual ~raw() {};
 
@@ -77,11 +82,34 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
       return c;
     }
 
+    unsigned length() const {
+      return len;
+    }
+
     bool is_page_aligned() {
       return ((long)data & ~CEPH_PAGE_MASK) == 0;
     }
     bool is_n_page_sized() {
       return (len & ~CEPH_PAGE_MASK) == 0;
+    }
+    bool have_crc() const {
+      Spinlock::Locker l(crc_lock);
+      return crc_in >= 0;
+    }
+    uint32_t get_crc_base() const {
+      Spinlock::Locker l(crc_lock);
+      assert(crc_in >= 0);
+      return crc_in;
+    }
+    uint32_t get_crc_value() const {
+      Spinlock::Locker l(crc_lock);
+      assert(crc_out >= 0);
+      return crc_out;
+    }
+    void set_crc(uint32_t b, uint32_t v) {
+      Spinlock::Locker l(crc_lock);
+      crc_in = b;
+      crc_out = v;
     }
   };
 
@@ -1272,8 +1300,23 @@ __u32 buffer::list::crc32c(__u32 crc) const
   for (std::list<ptr>::const_iterator it = _buffers.begin();
        it != _buffers.end();
        ++it)
-    if (it->length())
-      crc = ceph_crc32c(crc, (unsigned char*)it->c_str(), it->length());
+    if (it->length()) {
+      raw *r = it->get_raw();
+      if (it->offset() == 0 &&
+	  it->length() == r->length()) {
+	if (r->have_crc() &&
+	    r->get_crc_base() == crc) {
+	  crc = r->get_crc_value();
+	} else {
+	  uint32_t base = crc;
+	  crc = ceph_crc32c(crc, (unsigned char*)it->c_str(), it->length());
+	  r->set_crc(base, crc);
+	}
+      } else {
+	// partial extent of raw buffer; continue
+	crc = ceph_crc32c(crc, (unsigned char*)it->c_str(), it->length());
+      }
+    }
   return crc;
 }
 
