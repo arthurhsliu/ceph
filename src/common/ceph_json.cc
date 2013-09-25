@@ -222,7 +222,7 @@ bool JSONParser::parse(const char *buf_, int len)
     return false;
   }
 
-  string json_string = buf_;
+  string json_string(buf_, len);
   // make a substring to len
   json_string = json_string.substr(0, len);
   success = read(json_string, data);
