@@ -31,6 +31,9 @@
 
 namespace ceph {
 
+
+static unsigned char zbuf[128];
+
 #ifdef BUFFER_DEBUG
 static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
 # define bdout { simple_spin_lock(&buffer_debug_lock); std::cout
@@ -62,6 +65,7 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     atomic_t nref;
 
     Spinlock crc_lock;
+    map<pair<off_t, off_t>, pair<int64_t, int64_t> > crc_map;
     int64_t crc_in;   ///< cached crc base; -1 if invalid
     int64_t crc_out;  ///< cached crc value; -1 if invalid
 
@@ -92,24 +96,20 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     bool is_n_page_sized() {
       return (len & ~CEPH_PAGE_MASK) == 0;
     }
-    bool have_crc() const {
+    bool get_crc(const pair<off_t, off_t> &fromto,
+		 pair<int64_t, int64_t> *crc) const {
       Spinlock::Locker l(crc_lock);
-      return crc_in >= 0;
+      map<pair<off_t, off_t>, pair<int64_t, int64_t> >::const_iterator i =
+	crc_map.find(fromto);
+      if (i == crc_map.end())
+	return false;
+      *crc = i->second;
+      return true;
     }
-    uint32_t get_crc_base() const {
+    void set_crc(const pair<off_t, off_t> &fromto,
+		 const pair<uint64_t, uint64_t> &crc) {
       Spinlock::Locker l(crc_lock);
-      assert(crc_in >= 0);
-      return crc_in;
-    }
-    uint32_t get_crc_value() const {
-      Spinlock::Locker l(crc_lock);
-      assert(crc_out >= 0);
-      return crc_out;
-    }
-    void set_crc(uint32_t b, uint32_t v) {
-      Spinlock::Locker l(crc_lock);
-      crc_in = b;
-      crc_out = v;
+      crc_map[fromto] = crc;
     }
   };
 
@@ -1299,24 +1299,40 @@ __u32 buffer::list::crc32c(__u32 crc) const
 {
   for (std::list<ptr>::const_iterator it = _buffers.begin();
        it != _buffers.end();
-       ++it)
+       ++it) {
     if (it->length()) {
       raw *r = it->get_raw();
-      if (it->offset() == 0 &&
-	  it->length() == r->length()) {
-	if (r->have_crc() &&
-	    r->get_crc_base() == crc) {
-	  crc = r->get_crc_value();
+      pair<off_t, off_t> ofs(it->offset(), it->offset() + it->length());
+      pair<int64_t, int64_t> ccrc;
+      if (r->get_crc(ofs, &ccrc)) {
+	if (ccrc.first == crc) {
+	  // got it already
+	  crc = ccrc.second;
 	} else {
-	  uint32_t base = crc;
-	  crc = ceph_crc32c(crc, (unsigned char*)it->c_str(), it->length());
-	  r->set_crc(base, crc);
+	  /* If we have cached crc32c(buf, v) for initial value v,
+	   * we can convert this to a different initial value v' by:
+	   * crc32c(buf, v') = crc32c(buf, v) ^ adjustment
+	   * where adjustment = crc32c(0*len(buf), v ^ v')
+	   *
+	   * http://crcutil.googlecode.com/files/crc-doc.1.0.pdf
+	   * note, u for our crc32c implementation is 0
+	   */
+	  int64_t adjustment = ccrc.first ^ crc;
+	  size_t remaining = it->length();
+	  for (; remaining > sizeof(zbuf); remaining -= sizeof(zbuf)) {
+	    adjustment = ceph_crc32c(adjustment, zbuf, sizeof(zbuf));
+	  }
+	  if (remaining)
+	    adjustment = ceph_crc32c(adjustment, zbuf, remaining);
+	  crc = ccrc.second ^ adjustment;
 	}
       } else {
-	// partial extent of raw buffer; continue
+	uint32_t base = crc;
 	crc = ceph_crc32c(crc, (unsigned char*)it->c_str(), it->length());
+	r->set_crc(ofs, make_pair(base, crc));
       }
     }
+  }
   return crc;
 }
 
